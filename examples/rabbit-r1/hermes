@@ -1,0 +1,14 @@
+#!/bin/sh
+# A client shim: /usr/local/bin/hermes inside the rabbit-agent container.
+#
+# rabbit's node agent spawns `hermes acp` and speaks ACP over its pipes. There
+# is no Hermes CLI in that container -- this presents the face of one and relays
+# the stdio to acpd over TCP.
+#
+# It is deliberately DUMB. argv crosses verbatim as the first line and every
+# reply comes from the other side, so it can never drift from what the agent
+# actually is. This is the whole client-side integration: 4 lines of logic.
+set -eu
+ACPD_HOST="${ACPD_HOST:-hermes}"
+ACPD_PORT="${ACPD_PORT:-9099}"
+{ printf '%s\n' "$*"; exec cat; } | exec socat - "TCP:${ACPD_HOST}:${ACPD_PORT}"

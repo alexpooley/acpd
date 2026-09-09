@@ -1,0 +1,31 @@
+# Server side: run acpd inside (or beside) the container that runs your agent.
+#
+# Here it shares the Hermes container so it can reach the gateway on loopback
+# and read the version from the install. The supervision loop matters: on a cold
+# start acpd will lose a race or two against the agent's own boot (the gateway
+# is not listening yet; /opt/data permissions are still settling) and simply
+# needs to retry.
+services:
+  hermes:
+    image: nousresearch/hermes-agent:v2026.9.7
+    entrypoint:
+      - /bin/sh
+      - -c
+      - '(while true; do
+            su -s /bin/sh hermes -c "ACPD_LISTEN=0.0.0.0:9099 exec python -m acpd"
+              >> /opt/data/acpd.log 2>&1;
+            sleep 2;
+          done) &
+         exec /opt/hermes/docker/entrypoint-dispatch.sh "$@"'
+      - --
+    # 9099 is deliberately NOT published: clients reach it by container name on
+    # a shared docker network. Publishing it would expose an unauthenticated
+    # full-tool agent session to your LAN.
+    networks:
+      - default
+      - rabbitnet
+
+networks:
+  rabbitnet:
+    external: true
+    name: rabbit-agent_rabbitnet

@@ -1,0 +1,17 @@
+[project]
+name = "acpd"
+version = "0.1.0"
+description = "An ACP server: serve the Agent Client Protocol over a socket, backed by a warm agent"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Pooley" }]
+keywords = ["acp", "agent-client-protocol", "agent", "hermes"]
+dependencies = ["websockets>=12", "aiohttp>=3.9"]
+
+[project.scripts]
+acpd = "acpd.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,229 @@
+"""acpd — an ACP server.
+
+The Agent Client Protocol is specified as a subprocess contract: the client
+spawns an agent binary and talks JSON-RPC over its pipes. That is a fine model
+for an editor opening one project, and a poor one for a device that reconnects
+per utterance -- every connection pays a cold agent build.
+
+acpd serves ACP over a SOCKET instead, backed by an agent process that is
+already running and already warm. Measured against Hermes on a home server:
+
+    hermes acp (spawn per connection)   2600 ms to a ready session
+    acpd (socket, warm backend)           60 ms
+
+Clients need no modification. They still spawn something -- a few lines of
+socat, or any shim that relays stdio to a port -- and the ACP conversation is
+byte-identical. See examples/rabbit-r1.
+
+Design rules, learned the hard way:
+
+* One connection, one session, one backend link. NOT multiplexed onto a shared
+  connection: sharing means sharing request ids, cancellations and permission
+  routing, and every mistake in that class fails silently -- the client simply
+  discards a malformed frame and nothing appears in any log you own.
+* No policy. acpd does not decide what is risky, how long a human may take to
+  answer, or which choice is sensible. It carries the question and the answer.
+* Fail loudly. A missing backend method is an error the operator sees, not a
+  quiet downgrade to something slower.
+"""
+
+import asyncio
+import logging
+import os
+
+from . import protocol as p
+
+log = logging.getLogger("acpd")
+
+# Advertised to clients at initialize. Only claim what the backend can do:
+# telling a client we speak a capability we cannot honour is worse than
+# admitting we do not, because the client may then withhold work from us.
+AGENT_CAPABILITIES = {
+    "loadSession": True,
+    "promptCapabilities": {"image": False},
+    "sessionCapabilities": {"list": {}, "resume": {}},
+}
+
+
+class Connection:
+    """One ACP client. Owns its backend link and the state of one turn."""
+
+    def __init__(self, backend, reader, writer):
+        self.backend = backend
+        self.reader = reader
+        self.writer = writer
+        self.session_id = None
+        self._rid = 0
+        self._pending = {}          # our requests to the client
+        self._loop = asyncio.get_event_loop()
+        backend.on_update = self._send_update
+        backend.ask_permission = self._ask_permission
+
+    # -- to the client --
+    def _write(self, obj):
+        self.writer.write(p.encode(obj))
+
+    def _send_update(self, update):
+        self._write(p.notification("session/update",
+                                   {"sessionId": self.session_id, "update": update}))
+
+    async def _ask_permission(self, tool_call, options):
+        """ACP has the AGENT ask the client. Backends whose agent works the
+        other way round (an event plus a respond call) bridge through here.
+
+        Deliberately unbounded: the agent owns the deadline. A second timer here
+        races the first -- ours firing sends an answer the agent never asked
+        for; theirs firing leaves us answering a question that no longer exists.
+        """
+        self._rid += 1
+        rid = "acpd-%d" % self._rid
+        fut = self._loop.create_future()
+        self._pending[rid] = fut
+        self._write(p.request(rid, "session/request_permission",
+                              {"sessionId": self.session_id,
+                               "toolCall": tool_call, "options": options}))
+        res = await fut
+        return ((res or {}).get("outcome") or {}).get("optionId")
+
+    # -- from the client --
+    async def _handle(self, msg):
+        method, params = msg.get("method"), msg.get("params") or {}
+
+        if method == "initialize":
+            return {"protocolVersion": 1,
+                    "agentInfo": {"name": "acpd", "version": self.backend.name},
+                    "agentCapabilities": AGENT_CAPABILITIES,
+                    "authMethods": []}
+
+        if method == "session/new":
+            info = await self.backend.session_new(params.get("cwd") or ".")
+            self.session_id = info["sessionId"]
+            return {"sessionId": self.session_id,
+                    "models": {"availableModels": [],
+                               "currentModelId": info.get("model", "")},
+                    "modes": {"availableModes": [], "currentModeId": "default"}}
+
+        if method == "session/load":
+            self.session_id = params.get("sessionId")
+            await self.backend.session_load(self.session_id)
+            return {}
+
+        if method == "session/list":
+            return {"sessions": await self.backend.session_list()}
+
+        if method == "session/prompt":
+            self.session_id = params.get("sessionId") or self.session_id
+            reason = await self.backend.prompt(self.session_id, p.prompt_text(params))
+            return {"stopReason": reason}
+
+        if method == "session/cancel":
+            await self.backend.cancel(params.get("sessionId") or self.session_id)
+            return {}
+
+        raise RuntimeError("unsupported ACP method: %s" % method)
+
+    async def run(self):
+        while True:
+            line = await self.reader.readline()
+            if not line:
+                return
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = __import__("json").loads(line)
+            except ValueError:
+                log.warning("unparsable line from client; ignoring")
+                continue
+
+            rid = msg.get("id")
+            if rid is not None and "method" not in msg:      # a reply to us
+                fut = self._pending.pop(rid, None)
+                if fut and not fut.done():
+                    fut.set_result(msg.get("result") or {})
+                continue
+            try:
+                out = await self._handle(msg)
+                if rid is not None:
+                    self._write(p.result(rid, out))
+            except Exception as exc:
+                log.error("%s failed: %s", msg.get("method"), exc)
+                if rid is not None:
+                    self._write(p.error(rid, exc))
+
+
+async def _serve(backend_factory, reader, writer):
+    peer = writer.get_extra_info("peername")
+    log.info("connection from %s", peer)
+    try:
+        # A client may probe the binary before opening a session (rabbit sends
+        # `--version`). The shim forwards argv verbatim as the first line so the
+        # answer comes from here, beside the real agent, rather than being
+        # invented by the shim where it could drift.
+        first = (await reader.readline()).decode("utf-8", "replace").strip()
+        backend = backend_factory()
+        if first in ("--version", "-v", "version"):
+            writer.write((backend.version_string() + "\n").encode())
+            await writer.drain()
+            return
+        if first not in ("acp", ""):
+            log.warning("refusing unsupported invocation: %r", first[:60])
+            writer.write(("acpd: unsupported arguments: %s\n" % first[:60]).encode())
+            await writer.drain()
+            return
+        await backend.connect()
+        await Connection(backend, reader, writer).run()
+    except Exception as exc:
+        log.error("connection from %s failed: %s: %s", peer, type(exc).__name__, exc)
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        log.info("connection from %s closed", peer)
+
+
+async def serve_forever(backend_factory, host="0.0.0.0", port=9099):
+    """Accept ACP over TCP. One Connection and one backend link per client."""
+    # Preflight once so a moved backend surface is loud at startup rather than
+    # on whichever connection happens to arrive first.
+    probe = backend_factory()
+    await probe.connect()
+    await probe.preflight()
+    await probe.close()
+
+    server = await asyncio.start_server(
+        lambda r, w: _serve(backend_factory, r, w), host, port)
+    log.info("listening on %s:%s (backend: %s)", host, port, probe.name)
+    async with server:
+        await server.serve_forever()
+
+
+async def serve_stdio(backend_factory):
+    """Serve one ACP session on stdin/stdout -- a drop-in for the spawn model.
+
+    Useful for testing, and for clients that cannot be pointed at a socket.
+    Startup is still fast because the backend is a network client, not an agent.
+    """
+    import sys
+    loop = asyncio.get_event_loop()
+    reader = asyncio.StreamReader()
+    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+
+    class _StdoutWriter:
+        def write(self, data):
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        def get_extra_info(self, _):
+            return "stdio"
+
+    backend = backend_factory()
+    await backend.connect()
+    await Connection(backend, reader, _StdoutWriter()).run()

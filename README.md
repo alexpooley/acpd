@@ -4,19 +4,23 @@ Serve the [Agent Client Protocol](https://agentclientprotocol.com) over a
 socket, backed by an agent that is already running.
 
 ```
-hermes acp   (spawn an agent per connection)    2600 ms to a ready session
-acpd         (socket, warm agent behind it)       60 ms
+hermes acp   (agent spawned per connection)    2600 ms to a ready session
+acpd         (agent already running, warm)       60 ms
 ```
 
-## The problem
+## What this is not
 
-ACP is specified as a **subprocess contract**: the client spawns an agent binary
-and talks JSON-RPC over its pipes. Every transport the reference library ships
-is a spawn — `spawn_agent_process`, `spawn_stdio_connection`, and so on.
+ACP over a network transport is **not** new. The protocol supports remote agents
+over HTTP and WebSocket, the Rust and Kotlin SDKs ship WebSocket transports, and
+several bridges exist already — [acp-ws-bridge](https://github.com/ytthuan/acp-ws-bridge),
+`@rebornix/stdio-to-ws`, and others.
 
-That is the right model for an editor opening one project. It is the wrong model
-for anything that reconnects often, because each connection pays a cold agent
-build. Profiled on Hermes v0.21.1:
+Those are **relays**: they carry ACP bytes over a network to an agent that is
+still spawned as a subprocess. The transport moves; the cold start does not.
+
+## The problem acpd solves
+
+An ACP agent is normally a process the client starts. Profiled on Hermes v0.21.1:
 
 ```
 python interpreter + imports    0.30 s
@@ -26,13 +30,19 @@ adapter boot, session creation  ~1.4 s
                                 ~2.6 s   before a single token is generated
 ```
 
-Meanwhile the same install runs a long-lived server that **already holds agents
-warm** — Hermes' `gateway.agent_cache`, 128 entries, one-hour TTL, used by its
-desktop app and TUI. The ACP entry point simply does not go through it.
+Fine for an editor opening one project. Expensive for anything that reconnects
+often — a handset that talks per utterance pays it every time, including just to
+open the session list, where no model is involved at all.
+
+Meanwhile the same install already runs a long-lived server holding agents
+**warm** — Hermes' `gateway.agent_cache`, 128 entries, one-hour TTL, used by its
+own desktop app and TUI. The ACP entry point does not go through it.
 
 ## What acpd does
 
-Speaks ACP on a socket; forwards to the running agent's own API.
+**Terminates** ACP rather than relaying it. It implements the agent side and maps
+each call onto the running agent's own API, so there is no agent subprocess
+anywhere and nothing to cold-start.
 
 ```
 ACP client  ──stdio──▶  4-line shim  ──TCP──▶  acpd  ──▶  your agent (warm)
@@ -103,6 +113,15 @@ moved should produce an error an operator sees, not a service that quietly got
 **Claim only what you can honour.** Advertising a capability you cannot serve is
 worse than admitting you lack it — a client may withhold work from you, or send
 data down a channel you never implemented.
+
+## Prior art
+
+- [acp-ws-bridge](https://github.com/ytthuan/acp-ws-bridge) — WebSocket↔stdio relay to Copilot CLI
+- [hermes-acp-bridge](https://github.com/memoverflow/hermes-acp-bridge) — the inverse direction: Hermes as the *client*, Claude Code and Codex as agents
+- The official [Rust](https://agentclientprotocol.github.io/rust-sdk/) and Kotlin SDKs ship HTTP/WebSocket transports
+
+acpd differs from all of these in one respect: it does not relay to a spawned
+agent. That is the whole of the performance claim.
 
 ## Status
 

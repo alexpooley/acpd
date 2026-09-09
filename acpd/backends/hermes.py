@@ -76,6 +76,15 @@ CHOICE_KIND = {"once": "allow_once", "session": "allow_always",
 class HermesBackend:
     name = "hermes"
 
+    # What this backend can actually honour. session.resume and session.list
+    # back loadSession and the session picker; image blocks are not implemented,
+    # so they are not advertised even though Hermes itself supports attachments.
+    capabilities = {
+        "loadSession": True,
+        "promptCapabilities": {"image": False},
+        "sessionCapabilities": {"list": {}, "resume": {}},
+    }
+
     def __init__(self, base=None, user=None, password=None):
         self.base = base or os.environ.get("HERMES_SERVE_URL", "http://127.0.0.1:9119")
         self.user = user or os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "")

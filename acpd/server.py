@@ -35,13 +35,18 @@ from . import protocol as p
 
 log = logging.getLogger("acpd")
 
-# Advertised to clients at initialize. Only claim what the backend can do:
-# telling a client we speak a capability we cannot honour is worse than
-# admitting we do not, because the client may then withhold work from us.
-AGENT_CAPABILITIES = {
-    "loadSession": True,
+# Fallback only. Capabilities are the BACKEND's to declare -- it is the thing
+# that either can or cannot honour them, and hardcoding them here would make
+# acpd lie on behalf of any backend that differs. Override by setting
+# ``capabilities`` on your backend class.
+#
+# Only claim what you can serve: telling a client you speak a capability you
+# cannot honour is worse than admitting you lack it, because the client may
+# withhold work or send data down a channel you never implemented.
+DEFAULT_CAPABILITIES = {
+    "loadSession": False,
     "promptCapabilities": {"image": False},
-    "sessionCapabilities": {"list": {}, "resume": {}},
+    "sessionCapabilities": {},
 }
 
 
@@ -92,7 +97,8 @@ class Connection:
         if method == "initialize":
             return {"protocolVersion": 1,
                     "agentInfo": {"name": "acpd", "version": self.backend.name},
-                    "agentCapabilities": AGENT_CAPABILITIES,
+                    "agentCapabilities": getattr(self.backend, "capabilities",
+                                                 DEFAULT_CAPABILITIES),
                     "authMethods": []}
 
         if method == "session/new":

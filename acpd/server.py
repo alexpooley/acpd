@@ -35,6 +35,33 @@ from . import protocol as p
 
 log = logging.getLogger("acpd")
 
+
+def _prompt_prefix():
+    """Operator-supplied context prepended to every prompt.
+
+    Deliberately at the PROMPT level rather than in the agent's system prompt.
+    Editing a system prompt changes the cached prefix, and every surface of the
+    agent then pays a full cold prefill -- measured on one setup at ~32s against
+    ~2s warm. Prompt text does not touch that cache, so this can be changed as
+    often as you like at no cost.
+
+    Read fresh each turn so edits apply without restarting acpd. Empty by
+    default: acpd invents no instructions of its own, and this is a place for
+    the operator to put theirs.
+
+        ACPD_PROMPT_PREFIX       inline text
+        ACPD_PROMPT_PREFIX_FILE  path to a file (wins if both are set)
+    """
+    path = os.environ.get("ACPD_PROMPT_PREFIX_FILE", "")
+    if path:
+        try:
+            with open(path) as fh:
+                return fh.read().strip()
+        except OSError as exc:
+            log.warning("prompt prefix file unreadable (%s); continuing without it", exc)
+            return ""
+    return os.environ.get("ACPD_PROMPT_PREFIX", "").strip()
+
 # Fallback only. Capabilities are the BACKEND's to declare -- it is the thing
 # that either can or cannot honour them, and hardcoding them here would make
 # acpd lie on behalf of any backend that differs. Override by setting
@@ -119,7 +146,11 @@ class Connection:
 
         if method == "session/prompt":
             self.session_id = params.get("sessionId") or self.session_id
-            reason = await self.backend.prompt(self.session_id, p.prompt_text(params))
+            text = p.prompt_text(params)
+            prefix = _prompt_prefix()
+            if prefix:
+                text = prefix + "\n\n" + text
+            reason = await self.backend.prompt(self.session_id, text)
             return {"stopReason": reason}
 
         if method == "session/cancel":

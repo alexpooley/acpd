@@ -85,8 +85,24 @@ class HermesBackend:
         "sessionCapabilities": {"list": {}, "resume": {}},
     }
 
-    def __init__(self, base=None, user=None, password=None):
+    def __init__(self, base=None, user=None, password=None, profile=None):
         self.base = base or os.environ.get("HERMES_SERVE_URL", "http://127.0.0.1:9119")
+        # Hermes profiles carry their own config.yaml and SOUL.md, but a profile
+        # also means a DIFFERENT system prompt, hence a different prompt-cache
+        # prefix: the first turn pays a full cold prefill (measured: 34s against
+        # 1s warm) and two profiles in rotation can evict each other. Prefer the
+        # per-session overrides below, which leave the prompt identical.
+        self.profile = profile or os.environ.get("HERMES_PROFILE", "")
+        # Per-session overrides accepted by session.create. Hermes' own docstring
+        # calls these "PER-SESSION ... never a global config write", so they are
+        # the supported way to make one client behave differently.
+        #
+        # reasoning_effort matters most for a voice client: the handset speaks
+        # only once a turn completes, so reasoning tokens are silence the user
+        # sits through. Measured on this setup, "What is 2+2?": 5.19s to the
+        # first answer word with effort=medium, 0.99s with it off.
+        self.reasoning_effort = os.environ.get("ACPD_REASONING_EFFORT", "")
+        self.model = os.environ.get("ACPD_MODEL", "")
         self.user = user or os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "")
         self.password = password or os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "")
         self.ws = None
@@ -205,7 +221,15 @@ class HermesBackend:
 
     # -- the ACP surface --
     async def session_new(self, cwd):
-        res = await self._call(RPC["session/new"], {"cwd": cwd})
+        params = {"cwd": cwd}
+        if self.profile:
+            params["profile"] = self.profile
+            params["follow_profile_config"] = True
+        if self.reasoning_effort:
+            params["reasoning_effort"] = self.reasoning_effort
+        if self.model:
+            params["model"] = self.model
+        res = await self._call(RPC["session/new"], params)
         self._session = res.get("session_id")
         return {"sessionId": self._session, "model": (res.get("info") or {}).get("model", "")}
 

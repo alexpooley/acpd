@@ -71,30 +71,62 @@ Point a client at it with a shim on `PATH`:
 
 ## Tuning a client without touching the agent
 
-Two knobs, both scoped to ACP clients so the agent's other surfaces are
-unaffected:
-
 ```bash
-ACPD_REASONING_EFFORT=none                    # per-session override
-ACPD_PROMPT_PREFIX_FILE=/path/to/context.txt  # prepended to every prompt
+ACPD_REASONING_EFFORT=none                     # per-session override
+ACPD_SESSION_CONTEXT_FILE=/path/to/context.txt # seeded once per session
 ```
 
-`ACPD_PROMPT_PREFIX` is deliberately **prompt-level, not system-prompt-level**.
-Editing an agent's system prompt changes its cached prefix, and every surface
-then pays a full cold prefill — measured on one setup at ~32 s against ~2 s
-warm. Prompt text does not touch that cache, so it can be changed as often as
-you like at no cost, and acpd re-reads the file each turn.
+### Where context goes, and why it matters
 
-Worked example — a voice client that speaks only once a turn completes, so
-time-to-last-token *is* time-to-audio:
+Three places look interchangeable and are not:
+
+| | lives in | cost to change | repeats |
+|---|---|---|---|
+| **system prompt** (agent config, personality file, "profile") | the agent's cached prompt prefix | a full cold prefill on **every** surface of the agent | no |
+| **per-turn prefix** | prepended to each user message | free | **every turn** — the model re-reads it forever |
+| **session context** ← what acpd does | prepended to the session's first prompt | free | once |
+
+Measured on the reference setup: changing the agent's system prompt cost a
+**~32 s** cold prefill against **~2 s** warm, on every surface — the chat
+gateway and scheduled jobs too, not just the ACP client. Running a second system
+prompt permanently (an agent "profile") is worse: two prefixes then compete for
+one prompt cache and evict each other.
+
+So acpd prepends context to the **first prompt of a session** and never again.
+Literally `context + "\n\n" + prompt`. One copy per session, no cache prefix
+touched, and editable freely — the file is read at session start, so the next
+session picks it up with no restart.
+
+Seeding it as a `system` message via an agent's seed-history API looks tidier
+and is worse: on Hermes a second system role produced an **empty answer** every
+time (`seed=False -> "2+2 = 4"`, `seed=True -> ""`). Agents already have a
+system prompt. Concatenate.
+
+Empty by default. acpd invents no instructions of its own; this is where the
+operator puts theirs.
+
+### Worked example: a voice client
+
+A handset that speaks only once a turn completes, so time-to-last-token *is*
+time-to-audio:
 
 | | before | after |
 |---|---|---|
 | "What is 2+2?" | 5.2 s, 22 reasoning chunks | **1–3 s**, `4.` |
 | "capital of France?" | `The capital of France is **Paris**.` | `Paris.` |
 
-Reasoning off removed several seconds of silence; the prefix removed the
-markdown that text-to-speech reads aloud as punctuation.
+`ACPD_REASONING_EFFORT=none` removed seconds of silence — a voice client cannot
+speak while the model thinks. The session context removed the markdown that
+text-to-speech reads aloud as punctuation:
+
+```
+You are being listened to, not read. The handset plays your reply only once the
+turn is complete, so length is latency.
+
+- One or two sentences. Give the answer, not the working.
+- No markdown. Asterisks and backticks get read aloud by text-to-speech.
+- No preamble, no restating the question.
+```
 
 ## Backends
 

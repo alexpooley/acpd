@@ -55,3 +55,18 @@ send data down a channel that was never implemented.
 
 Newline-delimited JSON-RPC 2.0 over a byte stream. No content-length headers, no
 library required — `acpd/protocol.py` is 40 lines.
+
+## Session context
+
+acpd can prepend operator-supplied context to the **first prompt of a session**
+(`ACPD_SESSION_CONTEXT` / `ACPD_SESSION_CONTEXT_FILE`). It is plain string
+concatenation, done in the server, so backends need to know nothing about it.
+
+Two things it deliberately is not:
+
+* **Not a system prompt.** That is part of an agent's cached prompt prefix;
+  changing it makes every surface of the agent pay a cold prefill.
+* **Not a seed-history `system` message.** Tried, and on Hermes it produced an
+  empty answer every time — agents already have a system prompt and a second
+  system role conflicts with it.
+* **Not a per-turn prefix.** That repeats through the history forever.

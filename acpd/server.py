@@ -36,31 +36,38 @@ from . import protocol as p
 log = logging.getLogger("acpd")
 
 
-def _prompt_prefix():
-    """Operator-supplied context prepended to every prompt.
+def session_context():
+    """Operator-supplied context, seeded ONCE at the start of each session.
 
-    Deliberately at the PROMPT level rather than in the agent's system prompt.
-    Editing a system prompt changes the cached prefix, and every surface of the
-    agent then pays a full cold prefill -- measured on one setup at ~32s against
-    ~2s warm. Prompt text does not touch that cache, so this can be changed as
-    often as you like at no cost.
+    Not a system prompt, and not a per-turn prefix -- both were tried:
 
-    Read fresh each turn so edits apply without restarting acpd. Empty by
-    default: acpd invents no instructions of its own, and this is a place for
-    the operator to put theirs.
+    * A system prompt (or an agent "profile" carrying one) changes the agent's
+      cached prompt prefix. Every surface of the agent then pays a full cold
+      prefill: measured on the reference setup at ~32s against ~2s warm, and two
+      prefixes in rotation evict each other.
+    * A per-turn prefix avoids that but repeats itself through the conversation
+      history, growing every turn and saying the same thing to a model that has
+      already read it.
 
-        ACPD_PROMPT_PREFIX       inline text
-        ACPD_PROMPT_PREFIX_FILE  path to a file (wins if both are set)
+    Seeding it as the first message of a session costs one copy per session and
+    changes no cache prefix.
+
+    Read fresh at each session start, so edits apply to the next session without
+    restarting acpd. Empty by default: acpd invents no instructions of its own;
+    this is where the operator puts theirs.
+
+        ACPD_SESSION_CONTEXT       inline text
+        ACPD_SESSION_CONTEXT_FILE  path to a file (wins if both are set)
     """
-    path = os.environ.get("ACPD_PROMPT_PREFIX_FILE", "")
+    path = os.environ.get("ACPD_SESSION_CONTEXT_FILE", "")
     if path:
         try:
             with open(path) as fh:
                 return fh.read().strip()
         except OSError as exc:
-            log.warning("prompt prefix file unreadable (%s); continuing without it", exc)
+            log.warning("session context file unreadable (%s); continuing without it", exc)
             return ""
-    return os.environ.get("ACPD_PROMPT_PREFIX", "").strip()
+    return os.environ.get("ACPD_SESSION_CONTEXT", "").strip()
 
 # Fallback only. Capabilities are the BACKEND's to declare -- it is the thing
 # that either can or cannot honour them, and hardcoding them here would make
@@ -85,6 +92,7 @@ class Connection:
         self.reader = reader
         self.writer = writer
         self.session_id = None
+        self._seeded = False        # context goes on the first prompt only
         self._rid = 0
         self._pending = {}          # our requests to the client
         self._loop = asyncio.get_event_loop()
@@ -147,9 +155,15 @@ class Connection:
         if method == "session/prompt":
             self.session_id = params.get("sessionId") or self.session_id
             text = p.prompt_text(params)
-            prefix = _prompt_prefix()
-            if prefix:
-                text = prefix + "\n\n" + text
+            if not self._seeded:
+                # Once per session, on the first prompt. Not a system message
+                # (a second system role breaks generation on some agents -- it
+                # returned an empty answer on Hermes) and not every turn (that
+                # repeats itself through the history forever).
+                self._seeded = True
+                context = session_context()
+                if context:
+                    text = context + "\n\n" + text
             reason = await self.backend.prompt(self.session_id, text)
             return {"stopReason": reason}
 
